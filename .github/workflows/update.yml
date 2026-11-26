@@ -1,0 +1,37 @@
+name: update-signal-page
+# 처음 며칠은 '수동 실행(Run workflow)'만 쓰세요. 정상으로 돌면 아래 schedule 세 줄의 맨 앞 # 를 지워 자동 실행을 켭니다.
+on:
+  workflow_dispatch: {}
+  # schedule:
+  #   - cron: "35 21 * * 1-5"   # 한국시간 06:35 (화~토) 미국장 마감 뒤
+  #   - cron: "35 22 * * 1-5"   # 한국시간 07:35 (화~토) 서머타임 대비
+  #   - cron: "5 0 * * 2-6"     # 한국시간 09:05 (화~토) 예비
+permissions:
+  contents: write
+concurrency:
+  group: signal-page
+  cancel-in-progress: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: 잠금화면 이미지용 도구 설치
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk
+          pip install -q playwright
+          playwright install --with-deps chromium
+      - name: 상태 페이지 생성
+        run: python signal_page.py --out docs
+      - name: 변경 사항 올리기
+        run: |
+          git config user.name "signal-bot"
+          git config user.email "signal-bot@users.noreply.github.com"
+          git add docs
+          git diff --cached --quiet || git commit -m "update signals"
+          git push
