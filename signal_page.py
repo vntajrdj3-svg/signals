@@ -23,6 +23,10 @@ ENTRY_PCT, EXIT_PCT = 4.0, 3.0              # SPX 200일선 +4% 위 마감 ON / 
 BG_HALF, BG_ZERO, BG_BACK = 30.0, 40.0, 10.0  # 보디가드: 나스닥 이격 +30% → 50%, +40% → 0%, +10% 아래 → 100%
 ON_TICKER = "133690 TIGER 미국나스닥100"
 OFF_SPLIT = [("449170 TIGER KOFR금리액티브", 0.70), ("0064K0 KODEX 금액티브", 0.30)]
+# 1번 체제 규칙 (2026-11-27 시범 적용, 2027-05 확인) — claude/에너지규칙_사전등록_2026-11-27.md
+E_LOW = 0.0006                              # 되돌림 에너지 E = (1 - VR5_3년) × 변동성_1년² 의 '낮음' 경계 (고정)
+RP_RATE = 0.029 * (1 - 0.154)               # 메리츠 외화RP 세후 (킬스위치 비교용)
+COMM = 0.0007
 SYM_SPX, SYM_TQQQ, SYM_NDX = "^GSPC", "TQQQ", "^NDX"
 KST = dt.timezone(dt.timedelta(hours=9))
 
@@ -84,7 +88,8 @@ def ndx_state(dates, closes):
         hist.append((g, ovx, bg))
     g, ovx, bg = hist[-1]
     return dict(date=dates[-1], close=closes[-1], sma=sm[-1], gap=g, ovx=ovx, ovx_mult=OVX_MULT if ovx else 1.0,
-                bg=bg, bg_prev=hist[-2][2] if len(hist) > 1 else bg, hist={d: h[2] for d, h in zip(dates, hist)})
+                bg=bg, bg_prev=hist[-2][2] if len(hist) > 1 else bg, hist={d: h[2] for d, h in zip(dates, hist)},
+                ovx_hist=[h[1] for h in hist])
 
 
 def trend_state(dates, closes, ndx):
@@ -148,12 +153,92 @@ def rsi_layers(dates, closes):
     return dict(date=dates[-1], close=c[-1], layers=out, chart=dict(dates=dates[-63:], close=c[-63:]))
 
 
+def _vr5(x):
+    m = sum(x) / len(x); v1 = sum((a - m) ** 2 for a in x) / (len(x) - 1)
+    x5 = [sum(x[i:i + 5]) for i in range(len(x) - 4)]; m5 = sum(x5) / len(x5)
+    v5 = sum((a - m5) ** 2 for a in x5) / (len(x5) - 1)
+    return v5 / (5 * v1)
+
+
+def _month_start_idx(dates):
+    """마지막 데이터가 속한 달의 첫 거래일 위치 (지표는 그 전날까지 데이터로 계산 = 지난달 말)."""
+    i = len(dates) - 1
+    while i > 0 and dates[i - 1][:7] == dates[-1][:7]: i -= 1
+    return i
+
+
+def regime_energy(dates, closes):
+    """나스닥100: VR5 3년·1년, 변동성 1년, 되돌림 에너지. 지난달 말까지 데이터 (백테스트와 같은 시점)."""
+    i = _month_start_idx(dates)
+    r = [closes[k] / closes[k - 1] - 1 for k in range(1, i)]   # 지난달 말까지 일간 수익
+    if len(r) < 756: return None
+    x3, x1 = r[-756:], r[-252:]
+    m1 = sum(x1) / len(x1); vol = math.sqrt(sum((a - m1) ** 2 for a in x1) / (len(x1) - 1) * 252)
+    v3, v1 = _vr5(x3), _vr5(x1)
+    return dict(asof=dates[i - 1], vr5_3y=v3, vr5_1y=v1, vol1y=vol, E=(1 - v3) * vol ** 2)
+
+
+def shadow_s1(tdates, tcloses, ndx_hist):
+    """1번 '그림자' (규칙대로 계속 돌린 가상 계좌, 체제 규칙 없음). 킬스위치 판정용 자금 곡선."""
+    c = tcloses; n = len(c); K = len(RSI_LENS)
+    rsi = [[None] * n for _ in range(K)]; prj = [[None] * n for _ in range(K)]
+    for k, (L, T) in enumerate(zip(RSI_LENS, RSI_TARGETS)):
+        ag = al = None
+        for t in range(1, n):
+            ch = c[t] - c[t - 1]; g = max(ch, 0.0); l = max(-ch, 0.0)
+            if ag is None: ag, al = g, l
+            else: ag = (ag * (L - 1) + g) / L; al = (al * (L - 1) + l) / L
+            rv = 50.0 if ag + al == 0 else 100 * ag / (ag + al)
+            if T > rv: d = T / (100 - T) * al * (L - 1) - ag * (L - 1)
+            else:      d = al * (L - 1) - ((100 - T) / T) * ag * (L - 1)
+            rsi[k][t] = rv; prj[k][t] = c[t] + d
+    cash = 10000.0; sh = [0.0] * K; sig = [0.0] * K; peak = cash; eq = [None] * n; rd = RP_RATE / 252
+    for t in range(1, n):
+        cash += cash * rd if cash > 0 else 0.0
+        if t > 1:
+            for k in range(K):
+                r1, p1, T = rsi[k][t - 1], prj[k][t - 1], RSI_TARGETS[k]
+                if r1 > T and c[t] <= p1 and sig[k] > 0:
+                    q = min(sig[k], max(cash, 0) / (c[t] * (1 + COMM)))
+                    if q > 0: v = q * c[t]; cash -= v * (1 + COMM); sh[k] += q
+                if r1 < T and c[t] >= p1 and sh[k] > 0:
+                    v = sh[k] * c[t]; cash += v * (1 - COMM); sh[k] = 0.0
+        e = cash + sum(sh) * c[t]; eq[t] = e; peak = max(peak, e)
+        m = DD_MULT if (peak - e) / peak * 100 >= DD_TH else 1.0
+        h = ndx_hist.get(tdates[t]); m *= OVX_MULT if (h and h[1]) else 1.0
+        for k in range(K):
+            sig[k] = e * LAYER_PCT / 100 * m / prj[k][t] if (rsi[k][t] > RSI_TARGETS[k] and prj[k][t] > 0) else 0.0
+    return eq
+
+
+def kill_switch(tdates, eq):
+    """K3: 지난달 말 기준 1번 그림자의 3년(756일) 수익 < RP 3년 수익이면 켜짐."""
+    i = _month_start_idx(tdates) - 1
+    if i - 756 < 1 or eq[i - 756] is None: return None
+    s = eq[i] / eq[i - 756]; rp = (1 + RP_RATE / 252) ** 756
+    return dict(asof=tdates[i], s1_3y=s - 1, rp_3y=rp - 1, on=s < rp)
+
+
+def regime_rules(en, ks):
+    """R5: VR5 1년 ≥ 1 그리고 E < E_LOW → 새 층 중지. R10: 킬스위치 켜짐 그리고 E < E_LOW → 새 층 중지."""
+    if en is None: return dict(stop=False, why=[], ok=False)
+    low = en["E"] < E_LOW; why = []
+    if low and en["vr5_1y"] >= 1.0: why.append("R5")
+    if low and ks is not None and ks["on"]: why.append("R10")
+    return dict(stop=bool(why), why=why, ok=True, low=low)
+
+
 def build(spx, tq, nd):
     n = ndx_state(*nd); t = trend_state(*spx, n); r = rsi_layers(*tq)
-    n = {k: v for k, v in n.items() if k != "hist"}
-    return dict(version="v2 (2026-11-26 규칙)", updated_kst=dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M"),
+    en = regime_energy(*nd)
+    eq = shadow_s1(tq[0], tq[1], {d: (None, o, None) for d, o in zip(nd[0], n["ovx_hist"])})
+    ks = kill_switch(tq[0], eq); rg = regime_rules(en, ks)
+    n = {k: v for k, v in n.items() if k not in ("hist", "ovx_hist")}
+    return dict(version="v3 (2026-11-27 체제 규칙 시범)", updated_kst=dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M"),
                 trend=t, rsi=r, ndx=n, alloc=alloc_text(t["w133"]), alloc_prev=alloc_text(t["w133_prev"]),
-                rules=dict(layer_pct=LAYER_PCT, dd_th=DD_TH, dd_mult=DD_MULT, ovx_mult=n["ovx_mult"]))
+                energy=en, kill=ks, regime=rg,
+                rules=dict(layer_pct=LAYER_PCT, dd_th=DD_TH, dd_mult=DD_MULT, ovx_mult=n["ovx_mult"],
+                           regime_mult=0.0 if rg["stop"] else 1.0, kill_on=bool(ks and ks["on"])))
 
 
 PAGE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
@@ -187,9 +272,9 @@ __BODY__
 <div class="card"><h2>1번 주문 수량 계산 (이 기기에만 저장)</h2>
 <div class="grid"><div><label>1번 자금 지금 (달러) = 총자산 × 30%</label><input id="cap" inputmode="decimal" placeholder="예: 4500"></div>
 <div><label>1번 자금 고점 (달러)</label><input id="peak" inputmode="decimal" placeholder="예: 4700"></div></div>
-<label><input type="checkbox" id="ks" style="width:auto"> 킬스위치 켜짐 (TradingView 표가 🛑이면 체크 → 새 매수 없음)</label>
+<label><input type="checkbox" id="ks" style="width:auto"> 킬스위치 켜짐 (위 1번 칸 '킬스위치 켜짐'이고 운용수칙상 따르기로 했을 때만 체크)</label>
 <div class="sub" id="qtynote" style="margin-top:8px">자금을 넣으면 층마다 수량이 표시됩니다.</div></div>
-<footer>가격은 야후 파이낸스 일봉입니다. 이 페이지는 규칙대로 매매했을 때의 상태이며 실제 계좌와 다를 수 있습니다. 주문 전에 TradingView(피보나치 회귀 v5.0, 2번 SPX 차트)와 반드시 대조하세요. 킬스위치는 이 페이지가 계산하지 않습니다.</footer>
+<footer>가격은 야후 파이낸스 일봉입니다. 이 페이지는 규칙대로 매매했을 때의 상태이며 실제 계좌와 다를 수 있습니다. 주문 전에 TradingView(피보나치 회귀 v5.0, 2번 SPX 차트)와 반드시 대조하세요. 킬스위치·체제 규칙은 매달 말 기준으로 이 페이지가 계산합니다(킬스위치는 RP 2.9% 기준 근사).</footer>
 </main><script>
 const L=__LAYERS__, R=__RULES__;
 function g(k){try{return localStorage.getItem(k)}catch(e){return null}}
@@ -198,12 +283,13 @@ const cap=document.getElementById('cap'),pk=document.getElementById('peak'),ks=d
 cap.value=g('cap')||'';pk.value=g('peak')||'';ks.checked=g('ks')==='1';
 function upd(){s('cap',cap.value);s('peak',pk.value);s('ks',ks.checked?'1':'0');
  const c=parseFloat(cap.value),p=Math.max(parseFloat(pk.value)||0,c||0);const ok=c>0;
- const dd=ok&&p>0?(1-c/p)*100:0, dm=dd>=R.dd_th?R.dd_mult:1, m=dm*R.ovx_mult, amt=ok?c*R.layer_pct/100*m:0;
+ const dd=ok&&p>0?(1-c/p)*100:0, dm=dd>=R.dd_th?R.dd_mult:1, m=dm*R.ovx_mult*R.regime_mult, amt=ok?c*R.layer_pct/100*m:0;
  L.forEach((x,i)=>{const el=document.getElementById('q'+i);if(!el)return;
   if(x.action==='sell'){el.textContent='· 수량 전량';return}
+  if(x.action==='buy'&&R.regime_mult===0){el.textContent='· 체제 규칙: 매수 안 함';return}
   if(!ok||x.action!=='buy'||ks.checked){el.textContent=(x.action==='buy'&&ks.checked)?'· 킬스위치: 매수 안 함':'';return}
   el.textContent='· 수량 '+Math.floor(Math.round(amt)/x.price)+'주'});
- document.getElementById('qtynote').textContent=ok?('1번 EOD DD '+dd.toFixed(1)+'% → 낙폭 ×'+dm+' · 과열 ×'+R.ovx_mult+' → 층당 약 $'+Math.round(amt).toLocaleString()):'자금을 넣으면 층마다 수량이 표시됩니다.'}
+ document.getElementById('qtynote').textContent=ok?('1번 EOD DD '+dd.toFixed(1)+'% → 낙폭 ×'+dm+' · 과열 ×'+R.ovx_mult+' · 체제 ×'+R.regime_mult+' → 층당 약 $'+Math.round(amt).toLocaleString()):'자금을 넣으면 층마다 수량이 표시됩니다.'}
 [cap,pk,ks].forEach(e=>e.addEventListener('input',upd));upd();
 </script></body></html>"""
 
@@ -302,6 +388,16 @@ def change_text(st):
     return f"133690을 2번 자금의 {w*100:.0f}%로 줄이고, 판 돈은 449170 70 : 금 30"
 
 
+def regime_text(st):
+    """체제 규칙 한 줄 (페이지·잠금화면 공용)."""
+    en, ks, rg = st.get("energy"), st.get("kill"), st.get("regime", {})
+    if not en: return "체제 계산 불가 (데이터 부족)", ""
+    k = "-" if ks is None else ("켜짐" if ks["on"] else "정상")
+    base = f'되돌림 에너지 {en["E"]*1000:.2f} (낮음 < {E_LOW*1000:.1f}) · VR5 1년 {en["vr5_1y"]:.2f} · 킬스위치 {k}'
+    if rg.get("stop"): return base, f'새 층 매수 중지 ({"·".join(rg["why"])})'
+    return base, ""
+
+
 def render(st):
     t, r, nd = st["trend"], st["rsi"], st["ndx"]; e = html.escape
     cls = "on" if t["on"] else "off"
@@ -326,7 +422,9 @@ def render(st):
     nheld = sum(1 for x in r["layers"] if x["held"])
     rows = []
     for i, x in enumerate(r["layers"]):
-        if x["action"] == "buy": act = f'매수 ≤ <b>{x["price"]:,.2f}</b>'
+        stop = st.get("regime", {}).get("stop")
+        if x["action"] == "buy" and stop: act = f'<span class="warn">매수 중지</span> (기준 {x["price"]:,.2f})'
+        elif x["action"] == "buy": act = f'매수 ≤ <b>{x["price"]:,.2f}</b>'
         elif x["action"] == "sell": act = f'매도 ≥ <b>{x["price"]:,.2f}</b>'
         else: act = "대기"
         state = '<span class="chip on">보유</span>' if x["held"] else '<span class="chip">비어 있음</span>'
@@ -339,6 +437,8 @@ def render(st):
              f'<div class="top"><div><div class="huge">{nheld}<span style="font-size:22px;color:var(--mut)"> / 5 층 보유</span></div></div>'
              f'<div class="kv"><span>TQQQ 종가 {e(r["date"][5:])}</span><b>{r["close"]:,.2f}</b></div></div>'
              f'<div class="sub" style="margin-top:6px">층당 {LAYER_PCT:g}% · 낙폭 {DD_TH:g}% 이상 ×{DD_MULT:g} · {ovx}</div>'
+             + (lambda bt: f'<div class="sub" style="margin-top:4px">체제(지난달 말): {e(bt[0])}'
+                + (f' · <b class="warn">{e(bt[1])}</b>' if bt[1] else ' · <span class="on">정상</span>') + '</div>')(regime_text(st))
              + tqqq_chart(r) + '<div style="margin-top:6px">' + "".join(rows) + '</div></div>')
     layers_js = json.dumps([dict(action=x["action"], price=x["price"]) for x in r["layers"]])
     return (PAGE.replace("__UPDATED__", e(st["updated_kst"])).replace("__VER__", e(st["version"]))
@@ -460,6 +560,13 @@ def render_lock(st, top=250):
         elif x["action"] == "sell": act = f'<span class="off">매도 ≥ {x["price"]:,.2f}</span>'
         else: act = '<span class="mut">대기</span>'
         rows.append(f'<div class="row"><span class="nm">{x["length"]}일{" ●" if x["held"] else ""}</span><span class="act">{act}</span></div>')
+    stop = st.get("regime", {}).get("stop")
+    if stop:
+        rows = [x.replace('<span class="on">매수 ≤', '<span class="warn">중지 · ≤') for x in rows]
+    en = st.get("energy")
+    rtxt = (f'<span class="warn">새 매수 중지 ({"·".join(st["regime"]["why"])})</span>' if stop else
+            (f'체제 정상 · 에너지 {en["E"]*1000:.1f}' if en else '체제 -'))
+    rows.append(f'<div class="row"><span class="nm">체제</span><span class="act">{rtxt}</span></div>')
     mult = f'<span class="warn">과열 ×{OVX_MULT:g}</span>' if nd["ovx"] else "과열 아님"
     b.append(f'<div class="card"><div class="hd" style="display:flex;justify-content:space-between"><span>1번 · TQQQ {nheld}/5층</span>'
              f'<span>종가 {r["close"]:,.2f} · {mult}</span></div><div style="margin-top:4px">' + "".join(rows) + '</div></div>')
@@ -485,9 +592,9 @@ def main():
     ap.add_argument("--lock-top", type=int, default=250, help="잠금화면 이미지에서 내용이 시작되는 높이(0~1040)")
     a = ap.parse_args()
     spx = read_csv(a.csv_spx) if a.csv_spx else fetch_yahoo(SYM_SPX, "5y")
-    tq = read_csv(a.csv_tqqq) if a.csv_tqqq else fetch_yahoo(SYM_TQQQ, "2y")
+    tq = read_csv(a.csv_tqqq) if a.csv_tqqq else fetch_yahoo(SYM_TQQQ, "5y")
     nd = read_csv(a.csv_ndx) if a.csv_ndx else fetch_yahoo(SYM_NDX, "5y")
-    if len(spx[1]) < SMA_LEN + 5 or len(nd[1]) < SMA_LEN + 5 or len(tq[1]) < 60:
+    if len(spx[1]) < SMA_LEN + 5 or len(nd[1]) < 800 or len(tq[1]) < 800:
         sys.exit("가격 데이터가 부족합니다.")
     st = build(spx, tq, nd)
     os.makedirs(a.out, exist_ok=True)
@@ -500,6 +607,10 @@ def main():
     print(f"2번 {'ON' if t['on'] else 'OFF'} | SPX {t['close']:.1f} / 200일선 {t['sma']:.1f} ({t['pct']:+.2f}%) | 마지막 전환 {t['last_switch']}")
     print(f"    목표 배분: {fmt_alloc(st['alloc'])} | 나스닥 이격 {nd_['gap']:+.1f}% | 보디가드 {nd_['bg']:.2f} | 변경 {'있음' if t['changed'] else '없음'}")
     print(f"1번 과열 {'×0.5' if nd_['ovx'] else '아님'}")
+    en, ks, rg = st["energy"], st["kill"], st["regime"]
+    if en: print(f"1번 체제 ({en['asof']} 기준) VR5 3년 {en['vr5_3y']:.3f} · 1년 {en['vr5_1y']:.3f} · 변동성 {en['vol1y']*100:.1f}% · 에너지 {en['E']:.5f} (낮음 < {E_LOW})")
+    if ks: print(f"1번 킬스위치 ({ks['asof']} 기준) 그림자 3년 {ks['s1_3y']*100:+.1f}% vs RP {ks['rp_3y']*100:+.1f}% → {'켜짐' if ks['on'] else '정상'}")
+    print(f"1번 체제 규칙: {'새 층 매수 중지 ' + '·'.join(rg['why']) if rg['stop'] else '정상 (새 층 매수 가능)'}")
     for x in st["rsi"]["layers"]:
         print(f"1번 {x['length']:>2}일 RSI {x['rsi']:5.1f}/{x['target']} {'보유' if x['held'] else '비움'} {x['action']:4s} 기준가 {x['price']:.2f} ({x['dist_pct']:+.1f}%)")
 
