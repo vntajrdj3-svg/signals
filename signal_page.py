@@ -23,7 +23,7 @@ ENTRY_PCT, EXIT_PCT = 4.0, 3.0              # SPX 200일선 +4% 위 마감 ON / 
 BG_HALF, BG_ZERO, BG_BACK = 30.0, 40.0, 10.0  # 보디가드: 나스닥 이격 +30% → 50%, +40% → 0%, +10% 아래 → 100%
 ON_TICKER = "133690 TIGER 미국나스닥100"
 OFF_SPLIT = [("449170 TIGER KOFR금리액티브", 0.70), ("0064K0 KODEX 금액티브", 0.30)]
-# 1번 체제 규칙 (2026-11-27 시범 적용, 2027-05 확인) — claude/에너지규칙_사전등록_2026-11-27.md
+# 1번 매수 중지 규칙: 킬스위치(기존) + R5(2026-11-27 시범, 2027-05 확인) — claude/에너지규칙_결과_2026-11-27.md
 E_LOW = 0.0006                              # 되돌림 에너지 E = (1 - VR5_3년) × 변동성_1년² 의 '낮음' 경계 (고정)
 RP_RATE = 0.029 * (1 - 0.154)               # 메리츠 외화RP 세후 (킬스위치 비교용)
 COMM = 0.0007
@@ -220,12 +220,13 @@ def kill_switch(tdates, eq):
 
 
 def regime_rules(en, ks):
-    """R5: VR5 1년 ≥ 1 그리고 E < E_LOW → 새 층 중지. R10: 킬스위치 켜짐 그리고 E < E_LOW → 새 층 중지."""
-    if en is None: return dict(stop=False, why=[], ok=False)
-    low = en["E"] < E_LOW; why = []
-    if low and en["vr5_1y"] >= 1.0: why.append("R5")
-    if low and ks is not None and ks["on"]: why.append("R10")
-    return dict(stop=bool(why), why=why, ok=True, low=low)
+    """새 층 매수 중지 조건 (둘 중 하나라도).
+    킬스위치(기존 규칙, v4.4~): 1번 그림자 3년 수익 < RP 3년.
+    R5(2026-11-27 시범): VR5 1년 ≥ 1.0 그리고 되돌림 에너지 E < E_LOW."""
+    why = []
+    if ks is not None and ks["on"]: why.append("킬스위치")
+    if en is not None and en["E"] < E_LOW and en["vr5_1y"] >= 1.0: why.append("R5")
+    return dict(stop=bool(why), why=why, ok=en is not None, low=bool(en and en["E"] < E_LOW))
 
 
 def build(spx, tq, nd):
@@ -234,11 +235,11 @@ def build(spx, tq, nd):
     eq = shadow_s1(tq[0], tq[1], {d: (None, o, None) for d, o in zip(nd[0], n["ovx_hist"])})
     ks = kill_switch(tq[0], eq); rg = regime_rules(en, ks)
     n = {k: v for k, v in n.items() if k not in ("hist", "ovx_hist")}
-    return dict(version="v3 (2026-11-27 체제 규칙 시범)", updated_kst=dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M"),
+    return dict(version="v3.1 (2026-11-27 킬스위치+R5)", updated_kst=dt.datetime.now(KST).strftime("%Y-%m-%d %H:%M"),
                 trend=t, rsi=r, ndx=n, alloc=alloc_text(t["w133"]), alloc_prev=alloc_text(t["w133_prev"]),
                 energy=en, kill=ks, regime=rg,
                 rules=dict(layer_pct=LAYER_PCT, dd_th=DD_TH, dd_mult=DD_MULT, ovx_mult=n["ovx_mult"],
-                           regime_mult=0.0 if rg["stop"] else 1.0, kill_on=bool(ks and ks["on"])))
+                           regime_mult=0.0 if rg["stop"] else 1.0, stop_why="·".join(rg["why"]), kill_on=bool(ks and ks["on"])))
 
 
 PAGE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
@@ -272,25 +273,25 @@ __BODY__
 <div class="card"><h2>1번 주문 수량 계산 (이 기기에만 저장)</h2>
 <div class="grid"><div><label>1번 자금 지금 (달러) = 총자산 × 30%</label><input id="cap" inputmode="decimal" placeholder="예: 4500"></div>
 <div><label>1번 자금 고점 (달러)</label><input id="peak" inputmode="decimal" placeholder="예: 4700"></div></div>
-<label><input type="checkbox" id="ks" style="width:auto"> 킬스위치 켜짐 (위 1번 칸 '킬스위치 켜짐'이고 운용수칙상 따르기로 했을 때만 체크)</label>
+<div class="sub" style="margin-top:8px">킬스위치·R5로 매수가 중지된 달에는 수량이 표시되지 않습니다(이 페이지가 자동 판정).</div>
 <div class="sub" id="qtynote" style="margin-top:8px">자금을 넣으면 층마다 수량이 표시됩니다.</div></div>
 <footer>가격은 야후 파이낸스 일봉입니다. 이 페이지는 규칙대로 매매했을 때의 상태이며 실제 계좌와 다를 수 있습니다. 주문 전에 TradingView(피보나치 회귀 v5.0, 2번 SPX 차트)와 반드시 대조하세요. 킬스위치·체제 규칙은 매달 말 기준으로 이 페이지가 계산합니다(킬스위치는 RP 2.9% 기준 근사).</footer>
 </main><script>
 const L=__LAYERS__, R=__RULES__;
 function g(k){try{return localStorage.getItem(k)}catch(e){return null}}
 function s(k,v){try{localStorage.setItem(k,v)}catch(e){}}
-const cap=document.getElementById('cap'),pk=document.getElementById('peak'),ks=document.getElementById('ks');
-cap.value=g('cap')||'';pk.value=g('peak')||'';ks.checked=g('ks')==='1';
-function upd(){s('cap',cap.value);s('peak',pk.value);s('ks',ks.checked?'1':'0');
+const cap=document.getElementById('cap'),pk=document.getElementById('peak');
+cap.value=g('cap')||'';pk.value=g('peak')||'';
+function upd(){s('cap',cap.value);s('peak',pk.value);
  const c=parseFloat(cap.value),p=Math.max(parseFloat(pk.value)||0,c||0);const ok=c>0;
  const dd=ok&&p>0?(1-c/p)*100:0, dm=dd>=R.dd_th?R.dd_mult:1, m=dm*R.ovx_mult*R.regime_mult, amt=ok?c*R.layer_pct/100*m:0;
  L.forEach((x,i)=>{const el=document.getElementById('q'+i);if(!el)return;
   if(x.action==='sell'){el.textContent='· 수량 전량';return}
-  if(x.action==='buy'&&R.regime_mult===0){el.textContent='· 체제 규칙: 매수 안 함';return}
-  if(!ok||x.action!=='buy'||ks.checked){el.textContent=(x.action==='buy'&&ks.checked)?'· 킬스위치: 매수 안 함':'';return}
+  if(x.action==='buy'&&R.regime_mult===0){el.textContent='· '+R.stop_why+': 매수 안 함';return}
+  if(!ok||x.action!=='buy'){el.textContent='';return}
   el.textContent='· 수량 '+Math.floor(Math.round(amt)/x.price)+'주'});
  document.getElementById('qtynote').textContent=ok?('1번 EOD DD '+dd.toFixed(1)+'% → 낙폭 ×'+dm+' · 과열 ×'+R.ovx_mult+' · 체제 ×'+R.regime_mult+' → 층당 약 $'+Math.round(amt).toLocaleString()):'자금을 넣으면 층마다 수량이 표시됩니다.'}
-[cap,pk,ks].forEach(e=>e.addEventListener('input',upd));upd();
+[cap,pk].forEach(e=>e.addEventListener('input',upd));upd();
 </script></body></html>"""
 
 
@@ -610,7 +611,7 @@ def main():
     en, ks, rg = st["energy"], st["kill"], st["regime"]
     if en: print(f"1번 체제 ({en['asof']} 기준) VR5 3년 {en['vr5_3y']:.3f} · 1년 {en['vr5_1y']:.3f} · 변동성 {en['vol1y']*100:.1f}% · 에너지 {en['E']:.5f} (낮음 < {E_LOW})")
     if ks: print(f"1번 킬스위치 ({ks['asof']} 기준) 그림자 3년 {ks['s1_3y']*100:+.1f}% vs RP {ks['rp_3y']*100:+.1f}% → {'켜짐' if ks['on'] else '정상'}")
-    print(f"1번 체제 규칙: {'새 층 매수 중지 ' + '·'.join(rg['why']) if rg['stop'] else '정상 (새 층 매수 가능)'}")
+    print(f"1번 매수 중지 판정 (킬스위치 또는 R5): {'중지 ' + '·'.join(rg['why']) if rg['stop'] else '정상 (새 층 매수 가능)'}")
     for x in st["rsi"]["layers"]:
         print(f"1번 {x['length']:>2}일 RSI {x['rsi']:5.1f}/{x['target']} {'보유' if x['held'] else '비움'} {x['action']:4s} 기준가 {x['price']:.2f} ({x['dist_pct']:+.1f}%)")
 
