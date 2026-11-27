@@ -1,6 +1,6 @@
 {
- "version": "v3 (2026-11-27 체제 규칙 시범)",
- "updated_kst": "2026-11-27 19:59",
+ "version": "v3.1 (2026-11-27 킬스위치+R5)",
+ "updated_kst": "2026-11-27 20:07",
  "trend": {
   "on": false,
   "w133": 0.0,
@@ -1276,6 +1276,7 @@
   "dd_mult": 0.25,
   "ovx_mult": 1.0,
   "regime_mult": 1.0,
+  "stop_why": "",
   "kill_on": false
  }
 }
